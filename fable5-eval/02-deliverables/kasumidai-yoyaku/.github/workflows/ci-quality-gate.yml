@@ -1,0 +1,120 @@
+# 霞台市公共施設予約管理システム CI 品質ゲート(KSM-DEV-001 §7)
+# 配置先: .github/workflows/ci-quality-gate.yml
+# main へのマージ条件: 下記 4 ジョブすべての成功を必須チェックに設定する(ブランチ保護)。
+#   - 循環的複雑度 10 超       → backend-quality(Checkstyle)/ frontend-quality(ESLint)で失敗
+#   - レイヤー依存方向違反      → backend-quality(ArchUnit)/ frontend-quality(dependency-cruiser)で失敗
+#   - 命名規則・行長等の規約違反 → 同上
+#   - cdk-nag エラー           → iac-quality で失敗(steering/iac 規約4: 静的検査エラー0)
+#   - 依存ライブラリ Critical/High → security で失敗
+#
+# 【P4 実装完了時修正】ci-quality-gate.yml(dev-standards/)のパスを
+#   モノレポ実体(backend/, frontend/, infra/)に合わせて修正。
+#   dev-standards/ 版は設計定義書であり、本ファイルが実際に動作するCI定義。
+#   差分理由: dev-standards 版は apps/backend/ 等のサブディレクトリを想定していたが、
+#   KSM-REP-001 §2のモノレポ構成では backend/, frontend/, infra/ が直下配置のため。
+
+name: ci-quality-gate
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      backend: ${{ steps.filter.outputs.backend }}
+      frontend: ${{ steps.filter.outputs.frontend }}
+      infra: ${{ steps.filter.outputs.infra }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            backend: ['backend/**', 'migration-tool/**', 'standards/**']
+            frontend: ['frontend/**']
+            infra: ['infra/**']
+
+  backend-quality:
+    needs: changes
+    if: needs.changes.outputs.backend == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: '21', cache: maven }
+      # §3-6 TODO/FIXME を残したマージ禁止
+      - name: forbid TODO/FIXME
+        run: |
+          ! grep -rnE "(TODO|FIXME)" backend/src/main --include='*.java'
+      # §3・§4 Checkstyle(複雑度10・命名・行長等)。violation 1件で失敗
+      - name: checkstyle
+        run: mvn -B -f backend/pom.xml checkstyle:check
+      # §2 ArchUnit(レイヤー依存方向)を含む単体テスト
+      - name: unit tests (incl. ArchUnit)
+        run: mvn -B -f backend/pom.xml test
+      # §5.3 SAST
+      - name: spotbugs (+ findsecbugs)
+        run: mvn -B -f backend/pom.xml spotbugs:check
+
+  frontend-quality:
+    needs: changes
+    if: needs.changes.outputs.frontend == 'true'
+    runs-on: ubuntu-latest
+    defaults: { run: { working-directory: frontend } }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 22, cache: npm }
+      - run: npm ci
+      # §3・§4・§5.2 ESLint(複雑度10・命名・a11y)。警告0を強制
+      - name: eslint
+        run: npx eslint src --max-warnings 0
+      - name: type check
+        run: npx tsc --noEmit
+      # §2 レイヤー依存方向(dependency-cruiser)
+      - name: dependency-cruiser
+        run: npx depcruise --config dependency-cruiser.cjs src
+      - name: unit tests
+        run: npm test -- --run
+
+  iac-quality:
+    needs: changes
+    if: needs.changes.outputs.infra == 'true'
+    runs-on: ubuntu-latest
+    defaults: { run: { working-directory: infra } }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 22, cache: npm }
+      - run: npm ci
+      - name: eslint
+        run: npx eslint . --max-warnings 0
+      # steering/iac 規約4: cdk synth + cdk-nag(AwsSolutions + 命名/タグのカスタムルール)エラー0
+      # cdk-nag は Aspects として App に組込済み。エラーがあれば synth が失敗する
+      - name: cdk synth (with cdk-nag)
+        run: npx cdk synth --all --context env=dev
+      # CDK assertions テスト(暗号化・タグ・削除保護のプロパティ検査)
+      - name: cdk assertions tests
+        run: npm test -- --run
+
+  security:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # §5.3 依存ライブラリ脆弱性検査: Critical/High でブロック
+      - name: backend dependency check (OWASP Dependency-Check)
+        run: mvn -B -f backend/pom.xml org.owasp:dependency-check-maven:check -DfailBuildOnCVSS=7
+      - uses: actions/setup-node@v4
+        with: { node-version: 22 }
+      - name: frontend/iac npm audit
+        run: |
+          npm --prefix frontend audit --omit=dev --audit-level=high
+          npm --prefix infra audit --omit=dev --audit-level=high
