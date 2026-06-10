@@ -1,0 +1,32 @@
+# 霞台市公共施設予約管理システム バックエンド設定
+# 秘匿情報(DB認証情報・APIキー)はSecrets Manager経由で環境変数注入(KSM-DEV-002 S-42。直書き禁止)
+spring:
+  application:
+    name: yoyaku-backend
+  datasource:
+    url: ${YOYAKU_DB_URL:jdbc:postgresql://localhost:5432/yoyaku}
+    username: ${YOYAKU_DB_USER:yoyaku_app}
+    password: ${YOYAKU_DB_PASSWORD:}
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+  jackson:
+    time-zone: Asia/Tokyo
+
+server:
+  port: 8080
+  error:
+    include-stacktrace: never   # S-23:内部情報の非開示
+    include-message: never
+
+yoyaku:
+  notification:
+    queue-url: ${YOYAKU_NOTIFICATION_QUEUE_URL:}
+  payment:
+    webhook-secret: ${YOYAKU_PAYMENT_WEBHOOK_SECRET:}
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health
