@@ -1,0 +1,15 @@
+# CDK生成物・依存関係(git管理対象外)
+node_modules/
+cdk.out/
+*.js.map
+
+# TypeScriptコンパイル出力(ts-nodeで直接実行のため不要)
+*.d.ts
+
+# IDE
+.idea/
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
