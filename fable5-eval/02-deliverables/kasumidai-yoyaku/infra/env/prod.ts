@@ -11,7 +11,7 @@ export const prodParams: EnvParams = validateParams({
   // 実際のARNはデプロイ前に差し替え(GCAS環境構築後に取得)
   certificateArn: 'arn:aws:acm:us-east-1:ACCOUNT_ID:certificate/REPLACE_WITH_ACTUAL_ARN',
   // CloudFrontマネージドプレフィックスリスト(ALB SGの許可元)
-  cloudFrontPrefixListId: 'pl-3b927c52', // ap-northeast-1
+  cloudFrontPrefixListId: 'pl-58a04531', // ap-northeast-1 com.amazonaws.global.cloudfront.origin-facing
   apiDesiredCount: 2,
   apiMaxCount: 8,
   rdsMultiAz: true,

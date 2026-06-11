@@ -5,10 +5,14 @@
 export interface EnvParams {
   /** 環境名(リソース名 yoyaku-{env}-{role} の env 部=steering/iac規約2)。 */
   readonly envName: 'dev' | 'stg' | 'prod';
-  /** 公開ドメイン(QA No.20:DNS委任・SES認証は市側登録完了)。 */
-  readonly domainName: string;
-  /** ACM証明書ARN(us-east-1。CloudFront用)。 */
-  readonly certificateArn: string;
+  /** 公開ドメイン(QA No.20:DNS委任・SES認証は市側登録完了)。検証環境でドメイン未取得の場合は undefined。 */
+  readonly domainName?: string;
+  /**
+   * ACM証明書ARN(us-east-1。CloudFront用)。
+   * 検証環境でドメイン未取得の場合は undefined。
+   * undefined の場合は CloudFront デフォルトドメイン(*.cloudfront.net)で動作する。
+   */
+  readonly certificateArn?: string;
   /** CloudFront origin-facing マネージドプレフィックスリストID(ALB SGの許可元)。 */
   readonly cloudFrontPrefixListId: string;
   /** APIサービスの常時タスク数/最大タスク数(KSM-BDD-001 §3.1)。 */

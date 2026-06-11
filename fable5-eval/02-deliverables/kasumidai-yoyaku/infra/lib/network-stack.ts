@@ -62,27 +62,47 @@ export class NetworkStack extends cdk.Stack {
     Object.entries(tags).forEach(([k, v]) => cdk.Tags.of(this.vpc).add(k, v));
 
     // ── ALB セキュリティグループ ─────────────────────────
-    // CloudFront→ALB は HTTPS(443)のみ許可(CloudFrontマネージドプレフィックスリスト使用)
-    // steering/iac規約: 0.0.0.0/0 インバウンドは 443/80 のみ
+    // prod: CloudFrontマネージドプレフィックスリスト経由のみ許可
+    // stg: 0.0.0.0/0 からの 443/80 を許可
+    //   (理由: CloudFrontプレフィックスリストは45エントリ×2ルール=90重みで
+    //    アカウントのSGルール上限60を超過するため。stg環境は開発・検証用途のみ)
+    //   (KSM-ENV-001 §4: stgはコスト・制約の範囲で許容される簡略化を記録)
     this.albSg = new ec2.SecurityGroup(this, 'AlbSg', {
       vpc: this.vpc,
       securityGroupName: `yoyaku-${env}-sg-alb`,
-      description: 'ALB: allow HTTPS from CloudFront prefix list',
+      description: env === 'prod'
+        ? 'ALB: allow HTTPS from CloudFront prefix list (prod)'
+        : 'ALB: allow HTTP/HTTPS from internet for stg (CloudFront PL quota workaround)',
       allowAllOutbound: false,
     });
-    // CloudFrontマネージドプレフィックスリスト経由の HTTPS のみ許可
-    this.albSg.addIngressRule(
-      ec2.Peer.prefixList(params.cloudFrontPrefixListId),
-      ec2.Port.tcp(443),
-      'CloudFront HTTPS inbound',
-    );
-    // HTTP は CloudFront 側で HTTPS リダイレクト済みのため ALB では不要だが
-    // CloudFront→ALB がHTTPの場合のみ許可(CloudFront-ALB間はHTTP可)
-    this.albSg.addIngressRule(
-      ec2.Peer.prefixList(params.cloudFrontPrefixListId),
-      ec2.Port.tcp(80),
-      'CloudFront HTTP (redirect to HTTPS handled at CloudFront)',
-    );
+
+    if (env === 'prod') {
+      // prod: CloudFrontマネージドプレフィックスリスト経由のみ許可
+      this.albSg.addIngressRule(
+        ec2.Peer.prefixList(params.cloudFrontPrefixListId),
+        ec2.Port.tcp(443),
+        'CloudFront HTTPS inbound (prod)',
+      );
+      this.albSg.addIngressRule(
+        ec2.Peer.prefixList(params.cloudFrontPrefixListId),
+        ec2.Port.tcp(80),
+        'CloudFront HTTP inbound (prod)',
+      );
+    } else {
+      // stg: 0.0.0.0/0 から 443/80 を許可(プレフィックスリスト上限回避)
+      // steering/iac規約3: 0.0.0.0/0 インバウンドは 443/80 のみ → 準拠
+      this.albSg.addIngressRule(
+        ec2.Peer.anyIpv4(),
+        ec2.Port.tcp(443),
+        'HTTPS from internet (stg: CloudFront PL quota workaround)',
+      );
+      this.albSg.addIngressRule(
+        ec2.Peer.anyIpv4(),
+        ec2.Port.tcp(80),
+        'HTTP from internet (stg: CloudFront PL quota workaround)',
+      );
+    }
+
     // ALBからECSへのアウトバウンド
     this.albSg.addEgressRule(
       ec2.Peer.anyIpv4(),
@@ -91,15 +111,16 @@ export class NetworkStack extends cdk.Stack {
     );
     Object.entries(tags).forEach(([k, v]) => cdk.Tags.of(this.albSg).add(k, v));
 
-    // ALB SG の 0.0.0.0/0 ルールが存在しないことは上記設計で担保されているが
-    // cdk-nag AwsSolutions-EC23 を抑制(プレフィックスリスト使用のため)
     NagSuppressions.addResourceSuppressions(this.albSg, [
       {
         id: 'AwsSolutions-EC23',
         reason:
-          'ALB SG uses CloudFront managed prefix list (not 0.0.0.0/0). ' +
-          'Direct internet access is blocked at CloudFront layer. ' +
-          'steering/iac規約3準拠: SSH/RDP 全開放なし。443/80 のみ CloudFront 経由で許可。',
+          'prod: ALB SG uses CloudFront managed prefix list (not 0.0.0.0/0). ' +
+          'stg: 0.0.0.0/0 for 443/80 only — CloudFront managed prefix list has 45 entries ' +
+          'which exceeds account SGRule quota (60) when used twice (443+80). ' +
+          'steering/iac規約3準拠: SSH/RDP 全開放なし。443/80 のみ許可。' +
+          'stg環境でのALB直接アクセスはCloudFront WAFをバイパスするが、stgは開発用途のみ。' +
+          'KSM-ENV-001 §4に記録。',
       },
     ]);
 

@@ -78,6 +78,37 @@ export class StatefulStack extends cdk.Stack {
       pendingWindow: cdk.Duration.days(7),
       removalPolicy:
         env === 'prod' ? cdk.RemovalPolicy.RETAIN : cdk.RemovalPolicy.DESTROY,
+      // CloudWatch Logs サービスプリンシパルからの使用を許可(ロググループ暗号化に必要)
+      // https://docs.aws.amazon.com/AmazonCloudWatch/latest/logs/encrypt-log-data-kms.html
+      policy: new cdk.aws_iam.PolicyDocument({
+        statements: [
+          // キー管理者ポリシー(デフォルトのルートアカウントアクセス)
+          new cdk.aws_iam.PolicyStatement({
+            principals: [new cdk.aws_iam.AccountRootPrincipal()],
+            actions: ['kms:*'],
+            resources: ['*'],
+          }),
+          // CloudWatch Logs サービスプリンシパルへの使用許可
+          new cdk.aws_iam.PolicyStatement({
+            principals: [
+              new cdk.aws_iam.ServicePrincipal(`logs.${this.region}.amazonaws.com`),
+            ],
+            actions: [
+              'kms:Encrypt*',
+              'kms:Decrypt*',
+              'kms:ReEncrypt*',
+              'kms:GenerateDataKey*',
+              'kms:Describe*',
+            ],
+            resources: ['*'],
+            conditions: {
+              ArnLike: {
+                'kms:EncryptionContext:aws:logs:arn': `arn:aws:logs:${this.region}:${this.account}:log-group:*`,
+              },
+            },
+          }),
+        ],
+      }),
     });
     Object.entries(tags).forEach(([k, v]) => cdk.Tags.of(this.logKey).add(k, v));
     new cdk.CfnOutput(this, 'LogKeyArn', { value: this.logKey.keyArn, exportName: `yoyaku-${env}-key-log-arn` });
@@ -112,7 +143,7 @@ export class StatefulStack extends cdk.Stack {
     this.dbInstance = new rds.DatabaseInstance(this, 'RdsInstance', {
       instanceIdentifier: `yoyaku-${env}-db`,
       engine: rds.DatabaseInstanceEngine.postgres({
-        version: rds.PostgresEngineVersion.VER_16_4, // 最新安定版(P4構築時点)
+        version: rds.PostgresEngineVersion.VER_16_9, // 最新安定版(P4構築時点)
       }),
       instanceType: ec2.InstanceType.of(
         ec2.InstanceClass.T4G,
@@ -145,7 +176,7 @@ export class StatefulStack extends cdk.Stack {
       autoMinorVersionUpgrade: true, // マイナーバージョン自動適用(NFR-C03)
       parameterGroup: new rds.ParameterGroup(this, 'RdsParamGroup', {
         engine: rds.DatabaseInstanceEngine.postgres({
-          version: rds.PostgresEngineVersion.VER_16_4,
+          version: rds.PostgresEngineVersion.VER_16_9,
         }),
         parameters: {
           'shared_preload_libraries': 'pg_stat_statements',
@@ -244,7 +275,7 @@ export class StatefulStack extends cdk.Stack {
       },
       userInvitation: {
         emailSubject: '【霞台市】仮パスワードのご案内',
-        emailBody: '仮パスワード: {####}',
+        emailBody: 'ユーザー名: {username} / 仮パスワード: {####}',
       },
     });
     Object.entries(tags).forEach(([k, v]) => cdk.Tags.of(this.userPool).add(k, v));
@@ -433,6 +464,7 @@ export class StatefulStack extends cdk.Stack {
       autoDeleteObjects: env !== 'prod',
     });
     Object.entries(tags).forEach(([k, v]) => cdk.Tags.of(this.logS3).add(k, v));
+
     NagSuppressions.addResourceSuppressions(this.logS3, [
       {
         id: 'AwsSolutions-S1',

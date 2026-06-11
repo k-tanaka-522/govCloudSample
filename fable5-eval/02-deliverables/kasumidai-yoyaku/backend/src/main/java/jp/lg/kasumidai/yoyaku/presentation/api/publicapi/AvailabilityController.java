@@ -17,7 +17,7 @@ import org.springframework.web.bind.annotation.RestController;
  * Cache-Control 60秒(KSM-ADR-009。個人情報を含まない公開データのみ)。
  */
 @RestController
-@RequestMapping("/api/public/v1")
+@RequestMapping("/public/v1")
 public class AvailabilityController {
 
   private static final long CACHE_SECONDS = 60L;

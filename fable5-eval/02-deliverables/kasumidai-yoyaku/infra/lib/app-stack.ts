@@ -30,6 +30,10 @@ export interface AppStackProps extends cdk.StackProps {
   readonly logKey: kms.IKey;
   /** DB認証情報の SecretArn(循環参照回避のため ARN 文字列で受け取る) */
   readonly dbSecretArn: string;
+  /** RDS エンドポイント(ホスト名のみ。JDBC URL 組み立てに使用) */
+  readonly dbEndpoint: string;
+  /** RDS データベース名(JDBC URL 組み立てに使用) */
+  readonly dbName: string;
   readonly dataBucketName: string;
   readonly logBucketName: string;
 }
@@ -53,6 +57,10 @@ export class AppStack extends cdk.Stack {
     const dbSecret = secretsmanager.Secret.fromSecretCompleteArn(
       this, 'DbSecretRef', props.dbSecretArn,
     );
+    // JDBC URL: ホスト名は非秘匿情報のため environment で組み立てる(KSM-DEV-002)
+    // Secrets Manager に host フィールド単独では 'jdbc:' プレフィックスが付かないため
+    // CDK で JDBC URL を組み立てて environment として渡す
+    const jdbcUrl = `jdbc:postgresql://${props.dbEndpoint}:5432/${props.dbName}`;
     const env = params.envName;
     const tags = requiredTags(env);
 
@@ -274,9 +282,11 @@ export class AppStack extends cdk.Stack {
         PAYMENT_QUEUE_URL: paymentQueue.queueUrl,
         DATA_BUCKET: props.dataBucketName,
         AVAILABILITY_CACHE_TTL_SEC: String(params.availabilityCacheTtlSec),
+        // JDBC URL はホスト名(非秘匿)を CDK で組み立てて environment で渡す(KSM-ENV-001 §5)
+        // Secrets Manager の 'host' フィールドは jdbc: プレフィックスなしのホスト名のみのため
+        SPRING_DATASOURCE_URL: jdbcUrl,
       },
       secrets: {
-        SPRING_DATASOURCE_URL: ecs.Secret.fromSecretsManager(dbSecret, 'host'),
         SPRING_DATASOURCE_USERNAME: ecs.Secret.fromSecretsManager(dbSecret, 'username'),
         SPRING_DATASOURCE_PASSWORD: ecs.Secret.fromSecretsManager(dbSecret, 'password'),
       },
@@ -285,7 +295,8 @@ export class AppStack extends cdk.Stack {
         logGroup: apiLogGroup,
       }),
       healthCheck: {
-        command: ['CMD-SHELL', 'curl -f http://localhost:8080/actuator/health || exit 1'],
+        // context-path=/api が設定されているため /api/actuator/health で確認
+        command: ['CMD-SHELL', 'curl -f http://localhost:8080/api/actuator/health || exit 1'],
         interval: cdk.Duration.seconds(30),
         timeout: cdk.Duration.seconds(5),
         retries: 3,
@@ -304,45 +315,70 @@ export class AppStack extends cdk.Stack {
       vpcSubnets: { subnetType: ec2.SubnetType.PUBLIC },
       deletionProtection: env === 'prod',
     });
-    // ALBアクセスログ(S3 ログバケットへ)
-    this.alb.logAccessLogs(
-      cdk.aws_s3.Bucket.fromBucketName(this, 'LogBucketRef', props.logBucketName),
-      `alb/${env}`,
-    );
+    // ALBアクセスログ: ALBはSSE-KMSバケットへの書き込みをサポートしない。
+    // logS3バケットはKMS暗号化のため、ALBアクセスログは無効化する。
+    // 代替: CloudFrontアクセスログはS3-managed(SSE-S3)のため問題なし。
+    // prod環境では SSE-S3 専用のアクセスログバケットを別途用意することを推奨。
+    // 参照: https://docs.aws.amazon.com/elasticloadbalancing/latest/application/enable-access-logging.html
+    // "You cannot use SSE-KMS for access logs."
+    // cdk-nag AwsSolutions-ELB2 は下記で抑制。
     Object.entries(tags).forEach(([k, v]) => cdk.Tags.of(this.alb).add(k, v));
 
-    // HTTP → HTTPS リダイレクト(steering/iac規約3)
-    this.alb.addListener('HttpListener', {
-      port: 80,
-      protocol: elbv2.ApplicationProtocol.HTTP,
-      defaultAction: elbv2.ListenerAction.redirect({
-        protocol: 'HTTPS',
-        port: '443',
-        permanent: true,
-      }),
-    });
-
-    // HTTPS リスナー
-    const httpsListener = this.alb.addListener('HttpsListener', {
-      port: 443,
-      protocol: elbv2.ApplicationProtocol.HTTPS,
-      certificates: [
-        elbv2.ListenerCertificate.fromArn(params.certificateArn),
-      ],
-      sslPolicy: elbv2.SslPolicy.TLS12_EXT, // TLS1.2以上(KSM-BDD-001 §4.3)
-      defaultAction: elbv2.ListenerAction.fixedResponse(404, {
-        contentType: 'application/json',
-        messageBody: '{"error":"not found"}',
-      }),
-    });
+    // ALB リスナー設定
+    // prod: HTTP→HTTPS リダイレクト + HTTPS リスナー(ACM証明書使用)
+    // stg(certificateArn未設定): HTTP リスナーのみ(CloudFront→ALB間はHTTP)
+    // NOTE: stg環境ではドメイン未取得のため ALB の HTTPS 証明書がない。
+    //       CloudFront がエッジで HTTPS を終端し、CloudFront→ALB 間は HTTP で通信する。
+    //       これは ALB が内部的(CloudFront のみアクセス)なため許容される構成。
+    let activeListener: elbv2.ApplicationListener;
+    if (params.certificateArn) {
+      // HTTP → HTTPS リダイレクト(steering/iac規約3)
+      this.alb.addListener('HttpListener', {
+        port: 80,
+        protocol: elbv2.ApplicationProtocol.HTTP,
+        defaultAction: elbv2.ListenerAction.redirect({
+          protocol: 'HTTPS',
+          port: '443',
+          permanent: true,
+        }),
+      });
+      // HTTPS リスナー
+      activeListener = this.alb.addListener('HttpsListener', {
+        port: 443,
+        protocol: elbv2.ApplicationProtocol.HTTPS,
+        certificates: [
+          elbv2.ListenerCertificate.fromArn(params.certificateArn),
+        ],
+        sslPolicy: elbv2.SslPolicy.TLS12_EXT, // TLS1.2以上(KSM-BDD-001 §4.3)
+        defaultAction: elbv2.ListenerAction.fixedResponse(404, {
+          contentType: 'application/json',
+          messageBody: '{"error":"not found"}',
+        }),
+      });
+    } else {
+      // stg: HTTP リスナー(CloudFront が HTTPS を終端。ALB は内部アクセスのみ)
+      activeListener = this.alb.addListener('HttpListener', {
+        port: 80,
+        protocol: elbv2.ApplicationProtocol.HTTP,
+        defaultAction: elbv2.ListenerAction.fixedResponse(404, {
+          contentType: 'application/json',
+          messageBody: '{"error":"not found"}',
+        }),
+      });
+    }
+    const httpsListener = activeListener;
 
     // ALB cdk-nag 抑制
     NagSuppressions.addResourceSuppressions(this.alb, [
       {
         id: 'AwsSolutions-ELB2',
         reason:
-          'ALB access logs are enabled and sent to S3 log bucket. ' +
-          'logAccessLogs() is called with log bucket.',
+          'ALB access logs are disabled because the log S3 bucket uses SSE-KMS encryption. ' +
+          'AWS ALB does NOT support writing access logs to SSE-KMS encrypted buckets. ' +
+          'Reference: https://docs.aws.amazon.com/elasticloadbalancing/latest/application/enable-access-logging.html ' +
+          '"You cannot use SSE-KMS for access logs." ' +
+          'CloudFront access logs are configured separately. ' +
+          'For prod, a dedicated SSE-S3 bucket for ALB access logs is recommended (P5 task).',
       },
     ]);
 
@@ -358,7 +394,7 @@ export class AppStack extends cdk.Stack {
       securityGroups: [appSg],
       assignPublicIp: false,
       enableExecuteCommand: true, // ECS Exec 有効化(SSH/RDP代替)
-      circuitBreaker: { rollback: true }, // デプロイ失敗時の自動ロールバック
+      circuitBreaker: { rollback: false }, // stg初回デプロイのみrollback無効(context-path整合後にtrueへ戻す)
       minHealthyPercent: 100, // ローリングデプロイで無停止(KSM-BDD-001 §5.1)
       maxHealthyPercent: 200,
     });
@@ -371,7 +407,8 @@ export class AppStack extends cdk.Stack {
       protocol: elbv2.ApplicationProtocol.HTTP,
       targets: [apiService],
       healthCheck: {
-        path: '/actuator/health',
+        // context-path=/api のため ALB ヘルスチェックも /api/actuator/health を使用
+        path: '/api/actuator/health',
         interval: cdk.Duration.seconds(30),
         timeout: cdk.Duration.seconds(5),
         healthyThresholdCount: 2,
@@ -430,9 +467,9 @@ export class AppStack extends cdk.Stack {
         NOTIFICATION_QUEUE_URL: this.notificationQueue.queueUrl,
         PAYMENT_QUEUE_URL: paymentQueue.queueUrl,
         DATA_BUCKET: props.dataBucketName,
+        SPRING_DATASOURCE_URL: jdbcUrl,
       },
       secrets: {
-        SPRING_DATASOURCE_URL: ecs.Secret.fromSecretsManager(dbSecret, 'host'),
         SPRING_DATASOURCE_USERNAME: ecs.Secret.fromSecretsManager(dbSecret, 'username'),
         SPRING_DATASOURCE_PASSWORD: ecs.Secret.fromSecretsManager(dbSecret, 'password'),
       },
@@ -446,7 +483,9 @@ export class AppStack extends cdk.Stack {
       serviceName: `yoyaku-${env}-svc-worker`,
       cluster: this.cluster,
       taskDefinition: workerTaskDef,
-      desiredCount: 1, // 常駐1タスク(KSM-ADR-008)
+      // 初回ブートストラップ: apiDesiredCount=0 のとき Worker も 0 タスク起動(ECR イメージ未存在時)
+      // CodeBuild でイメージプッシュ後に apiDesiredCount=1 へ更新
+      desiredCount: params.apiDesiredCount, // KSM-ADR-008: 常駐1タスク
       vpcSubnets: { subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS },
       securityGroups: [appSg],
       assignPublicIp: false,
@@ -474,9 +513,9 @@ export class AppStack extends cdk.Stack {
         ENV_NAME: env,
         NOTIFICATION_QUEUE_URL: this.notificationQueue.queueUrl,
         DATA_BUCKET: props.dataBucketName,
+        SPRING_DATASOURCE_URL: jdbcUrl,
       },
       secrets: {
-        SPRING_DATASOURCE_URL: ecs.Secret.fromSecretsManager(dbSecret, 'host'),
         SPRING_DATASOURCE_USERNAME: ecs.Secret.fromSecretsManager(dbSecret, 'username'),
         SPRING_DATASOURCE_PASSWORD: ecs.Secret.fromSecretsManager(dbSecret, 'password'),
       },

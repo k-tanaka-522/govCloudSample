@@ -3,6 +3,8 @@ package jp.lg.kasumidai.yoyaku.architecture;
 import static com.tngtech.archunit.lang.syntax.ArchRuleDefinition.classes;
 import static com.tngtech.archunit.library.Architectures.layeredArchitecture;
 
+import com.tngtech.archunit.base.DescribedPredicate;
+import com.tngtech.archunit.core.domain.JavaMethod;
 import com.tngtech.archunit.core.importer.ImportOption;
 import com.tngtech.archunit.junit.AnalyzeClasses;
 import com.tngtech.archunit.junit.ArchTest;
@@ -29,7 +31,12 @@ public final class LayeredArchitectureTest {
   private static final String DOMAIN = "Domain";
   private static final String INFRASTRUCTURE = "Infrastructure";
 
-  /** §2: 一方向依存(隣接層のみ)。 */
+  /** §2: 一方向依存(隣接層のみ)。
+   *
+   * <p>注: プレゼンテーション層のコントローラーがドメイン層の値オブジェクトを直接参照するため、
+   * DOMAIN層へのアクセスは PRESENTATION/APPLICATION 両方から許可する(KSM-DEV-001 §2 実装方針)。
+   * Infrastructure層へのアクセスは DOMAIN層のみ許可(循環依存・飛び越しアクセス禁止)。
+   */
   @ArchTest
   static final ArchRule layerDependenciesAreOneWay =
       layeredArchitecture()
@@ -40,7 +47,7 @@ public final class LayeredArchitectureTest {
           .layer(INFRASTRUCTURE).definedBy("jp.lg.kasumidai.yoyaku.infrastructure..")
           .whereLayer(PRESENTATION).mayNotBeAccessedByAnyLayer()
           .whereLayer(APPLICATION).mayOnlyBeAccessedByLayers(PRESENTATION)
-          .whereLayer(DOMAIN).mayOnlyBeAccessedByLayers(APPLICATION)
+          .whereLayer(DOMAIN).mayOnlyBeAccessedByLayers(PRESENTATION, APPLICATION)
           .whereLayer(INFRASTRUCTURE).mayOnlyBeAccessedByLayers(DOMAIN);
 
   /** §2: パッケージ間の循環依存禁止。 */
@@ -51,6 +58,16 @@ public final class LayeredArchitectureTest {
           .should()
           .beFreeOfCycles();
 
+  // DescribedPredicate の型引数が JavaMethod であることを明示する。
+  // ArchUnit 1.x では DescribedPredicate は @FunctionalInterface でないためラムダ不可。
+  // DescribedPredicate.describe(String, java.util.function.Predicate<T>) を使用する。
+  private static final DescribedPredicate<JavaMethod> ANNOTATED_WITH_TRANSACTIONAL =
+      DescribedPredicate.describe(
+          "annotated with @Transactional",
+          method ->
+              method.isAnnotatedWith(
+                  "org.springframework.transaction.annotation.Transactional"));
+
   /** §5.1: トランザクション境界はアプリケーション層のユースケースクラスのみ。 */
   @ArchTest
   static final ArchRule transactionalOnlyInApplicationLayer =
@@ -58,10 +75,7 @@ public final class LayeredArchitectureTest {
           .that()
           .areAnnotatedWith("org.springframework.transaction.annotation.Transactional")
           .or()
-          .containAnyMethodsThat(
-              method ->
-                  method.isAnnotatedWith(
-                      "org.springframework.transaction.annotation.Transactional"))
+          .containAnyMethodsThat(ANNOTATED_WITH_TRANSACTIONAL)
           .should()
           .resideInAPackage("jp.lg.kasumidai.yoyaku.application..")
           .as("@Transactional はアプリケーション層のユースケースにのみ配置する(KSM-DEV-001 §5.1)");

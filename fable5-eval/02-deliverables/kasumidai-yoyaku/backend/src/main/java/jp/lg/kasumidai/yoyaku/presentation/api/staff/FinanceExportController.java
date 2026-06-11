@@ -23,7 +23,7 @@ import org.springframework.web.bind.annotation.RestController;
  * 認証BFFと併せて実装予定。暫定ヘッダは ReservationController と同様(実装完了報告書 S-1)。
  */
 @RestController
-@RequestMapping("/api/staff/v1/finance-exports")
+@RequestMapping("/staff/v1/finance-exports")
 public class FinanceExportController {
 
   private final ExportFinanceCsvUseCase exportFinanceCsvUseCase;

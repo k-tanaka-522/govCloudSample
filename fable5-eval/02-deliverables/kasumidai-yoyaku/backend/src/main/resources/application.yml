@@ -7,6 +7,9 @@ spring:
     url: ${YOYAKU_DB_URL:jdbc:postgresql://localhost:5432/yoyaku}
     username: ${YOYAKU_DB_USER:yoyaku_app}
     password: ${YOYAKU_DB_PASSWORD:}
+    hikari:
+      maximum-pool-size: 5    # db.t4g.small max_connections ≈ 225; api×2(blue/green)+worker×1=15で余裕
+      minimum-idle: 2         # アイドル時の最小保持接続数
   flyway:
     enabled: true
     locations: classpath:db/migration
@@ -15,6 +18,11 @@ spring:
 
 server:
   port: 8080
+  # CloudFront → ALB → Spring Boot のパス転送:
+  # CloudFront は /api/* を ALB に送信するため context-path を /api に設定する
+  # これにより /api/actuator/health, /api/public/v1/... が正しくルーティングされる
+  servlet:
+    context-path: /api
   error:
     include-stacktrace: never   # S-23:内部情報の非開示
     include-message: never

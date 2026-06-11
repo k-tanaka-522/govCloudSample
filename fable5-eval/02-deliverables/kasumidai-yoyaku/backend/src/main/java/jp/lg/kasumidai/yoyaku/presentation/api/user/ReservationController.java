@@ -25,7 +25,7 @@ import org.springframework.web.bind.annotation.RestController;
  * 暫定ヘッダ(X-Dev-User-Id)で代替する(実装完了報告書 未実装一覧 S-1。本番経路では使用不可)。
  */
 @RestController
-@RequestMapping("/api/user/v1/reservations")
+@RequestMapping("/user/v1/reservations")
 public class ReservationController {
 
   private final ReserveFacilityUseCase reserveFacilityUseCase;

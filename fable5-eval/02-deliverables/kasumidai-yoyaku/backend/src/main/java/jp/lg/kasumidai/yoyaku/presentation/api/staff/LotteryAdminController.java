@@ -14,7 +14,7 @@ import org.springframework.web.bind.annotation.RestController;
  * 再実行(QA No.14回答のP6運用手順と連動)・動作確認用の職員起動経路。
  */
 @RestController
-@RequestMapping("/api/staff/v1/lottery-periods")
+@RequestMapping("/staff/v1/lottery-periods")
 public class LotteryAdminController {
 
   private final ExecuteLotteryUseCase executeLotteryUseCase;

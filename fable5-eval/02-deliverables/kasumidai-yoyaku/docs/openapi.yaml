@@ -1,0 +1,522 @@
+# =============================================================================
+# 霞台市公共施設予約管理システム API定義(正本)
+# 文書番号: KSM-API-001 / 版: 1.0 / 作成日: 令和8年6月11日
+# 位置付け: 外部IF設計の正本(KSM-ADR-013 決定4)。
+#   - 基本設計書(KSM-BDD-001 1.2版)6章、詳細設計分冊(KSM-DDD-001-NN)5章は
+#     本ファイルへの参照+要約表とする(steering/design-templates/10 #6)。
+#   - 実装済みエンドポイントはスキーマ確定(実装DTOと1:1)。
+#   - 設計済み・未実装(P5/P6)は x-implementation-status: designed を付す。
+#     実装済みは x-implementation-status: implemented(+ x-module: MOD-xxx)。
+# 認証に関する注記(スタブ宣言 S-1):
+#   利用者/職員の認証はCognito BFF(KSM-ADR-004)で行い、利用者IDはトークンから
+#   解決する設計。P4実装はdev限定の暫定ヘッダ(X-Dev-User-Id / X-Dev-Staff-Id)で
+#   代替しており、本定義の securitySchemes は設計(P5実装)を正とする。
+# =============================================================================
+openapi: 3.1.0
+info:
+  title: 霞台市公共施設予約管理システム API
+  version: "1.0"
+  description: >
+    REST/JSON。経路別プレフィックス: /api/public/*(未ログイン・GETのみ・CloudFrontキャッシュ対象)、
+    /api/user/*(利用者認証)、/api/staff/*(職員認証+WAF IP制限14拠点=NFR-E08)。
+    エラーはRFC 9457(Problem Details)形式で統一(GlobalExceptionHandler)。
+servers:
+  - url: https://yoyaku.city.kasumidai.lg.jp
+    description: 本番(prod)
+  - url: https://stg.yoyaku.city.kasumidai.lg.jp
+    description: 検証(stg)
+
+tags:
+  - name: public
+    description: 公開API(REQ-006/026。キャッシュ60秒=KSM-ADR-009)
+  - name: user
+    description: 利用者API(本人リソースのみ。user_idはトークンから解決)
+  - name: staff
+    description: 職員API(ロール×施設認可+IP制限。KSM-ADR-003)
+  - name: webhook
+    description: 外部システム受信(署名検証)
+
+paths:
+  /api/public/v1/availabilities:
+    get:
+      tags: [public]
+      operationId: getAvailabilities
+      summary: 空き状況照会(施設×年月)
+      description: 未ログイン可。Cache-Control max-age=60, public(KSM-ADR-009)。REQ-006。
+      x-implementation-status: implemented
+      x-module: MOD-001
+      parameters:
+        - name: facilityId
+          in: query
+          required: true
+          schema: { type: integer, format: int64 }
+        - name: month
+          in: query
+          required: true
+          description: YYYY-MM形式
+          schema: { type: string, pattern: '^\d{4}-\d{2}$' }
+      responses:
+        "200":
+          description: コマ別空き状況
+          headers:
+            Cache-Control:
+              schema: { type: string, example: "max-age=60, public" }
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/AvailabilitySlot' }
+  /api/public/v1/facilities:
+    get:
+      tags: [public]
+      operationId: listFacilities
+      summary: 施設一覧(REQ-006)
+      x-implementation-status: designed   # P5実装(MOD-310関連)
+      responses:
+        "200": { description: 施設一覧 }
+  /api/public/v1/notices:
+    get:
+      tags: [public]
+      operationId: listNotices
+      summary: お知らせ一覧(REQ-026)
+      x-implementation-status: designed   # P5実装(MOD-307)
+      responses:
+        "200": { description: お知らせ一覧 }
+  /api/public/v1/registrations:
+    post:
+      tags: [public]
+      operationId: createRegistration
+      summary: 利用者仮申請(REQ-001。レート制御=WAF)
+      x-implementation-status: designed   # P5実装(MOD-301)
+      responses:
+        "201": { description: 仮申請受付 }
+
+  /api/user/v1/reservations:
+    post:
+      tags: [user]
+      operationId: createReservation
+      summary: 先着予約申込(一括対応。全件成立=201/全件不成立=409)
+      description: >
+        REQ-007/009/010。上限チェック(KSM-BRL-001 §1)・料金算定(同 §3)・
+        休館/優先枠判定の上、単一トランザクションで全件成立または全件不成立。
+        二重予約のDBレベル防止=部分一意インデックス uq_active_slot。
+        二重送信防止=idempotencyKey。
+      x-implementation-status: implemented
+      x-module: MOD-002
+      security: [{ userAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ReservationRequest' }
+      responses:
+        "201":
+          description: 予約成立(pending=支払期限付き)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ReservationResponse' }
+        "409":
+          description: 全件不成立(不成立コマと理由の全件一覧=KSM-BRL-001 §2.1-3)
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/SlotConflictProblem' }
+        "400":
+          description: 入力検証エラー(fields配列で項目特定=REQ-014)
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/ValidationProblem' }
+        "422":
+          description: 業務例外(上限超過等。DomainException)
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+    get:
+      tags: [user]
+      operationId: listMyReservations
+      summary: 自分の予約一覧(REQ-011。マイページSC-U07)
+      x-implementation-status: designed   # P5実装(現状フロントはモック表示)
+      security: [{ userAuth: [] }]
+      responses:
+        "200": { description: 予約一覧 }
+
+  /api/user/v1/reservations/{id}/cancellation:
+    get:
+      tags: [user]
+      operationId: previewCancellation
+      summary: 取消の事前表示(取消期限・キャンセル料・還付見込=SC-U10)
+      description: REQ-011/019。キャンセル料=利用日7日前まで無料/6日前以降100%(KSM-BRL-001 §3.1)。
+      x-implementation-status: implemented
+      x-module: MOD-005
+      security: [{ userAuth: [] }]
+      parameters: [{ $ref: '#/components/parameters/reservationId' }]
+      responses:
+        "200":
+          description: 取消見込(cancelled=false)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CancellationResponse' }
+    post:
+      tags: [user]
+      operationId: cancelReservation
+      summary: 予約取消(キャンセル料・還付見込を返却)
+      x-implementation-status: implemented
+      x-module: MOD-005
+      security: [{ userAuth: [] }]
+      parameters: [{ $ref: '#/components/parameters/reservationId' }]
+      responses:
+        "200":
+          description: 取消完了(cancelled=true)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CancellationResponse' }
+        "422":
+          description: 取消不可(状態不整合等)
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+
+  /api/user/v1/lottery-entries:
+    post:
+      tags: [user]
+      operationId: createLotteryEntry
+      summary: 抽選申込(REQ-008。希望順位付き・同期軽量INSERT)
+      x-implementation-status: designed   # P5実装(申込画面SC-U09と併せて)
+      security: [{ userAuth: [] }]
+      responses:
+        "201": { description: 申込受付 }
+  /api/user/v1/payments/checkout:
+    post:
+      tags: [user]
+      operationId: createCheckout
+      summary: 決済セッション生成(REQ-016)
+      description: みらい収納サービス接続。PaymentGateway#createCheckout はP4スタブ(S-2。接続仕様書受領後に実装)。
+      x-implementation-status: designed
+      security: [{ userAuth: [] }]
+      responses:
+        "201": { description: リダイレクトURL+取引ID }
+  /api/user/v1/exemption-applications:
+    post:
+      tags: [user]
+      operationId: createExemptionApplication
+      summary: 減免申請(REQ-018)
+      x-implementation-status: designed   # P5実装(MOD-304)
+      security: [{ userAuth: [] }]
+      responses:
+        "201": { description: 申請受付 }
+  /api/user/v1/profile:
+    put:
+      tags: [user]
+      operationId: updateProfile
+      summary: 登録情報変更(REQ-004)
+      x-implementation-status: designed   # P5実装(MOD-301)
+      security: [{ userAuth: [] }]
+      responses:
+        "200": { description: 変更完了 }
+
+  /api/staff/v1/lottery-periods/{id}/executions:
+    post:
+      tags: [staff]
+      operationId: executeLottery
+      summary: 抽選実行(職員起動経路=バッチJB-01失敗時の再実行・動作確認用)
+      description: >
+        REQ-008(SC-S09)。通常の抽選実行はEventBridge Scheduler→ECS RunTask(JB-01)。
+        冪等(isAlreadyDrawn判定で再実行安全)。所管課ロール以上。
+      x-implementation-status: implemented
+      x-module: MOD-009
+      security: [{ staffAuth: [] }]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: 抽選期間ID
+          schema: { type: integer, format: int64 }
+      responses:
+        "200":
+          description: 実行サマリ(申込数・当選数・落選数)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/LotteryExecutionSummary' }
+
+  /api/staff/v1/finance-exports:
+    post:
+      tags: [staff]
+      operationId: exportFinanceCsv
+      summary: 財務会計連携CSV生成(REQ-020。SC-S14。会計担当ロール)
+      description: >
+        会計課様式第12号(Shift_JIS・CRLF・ヘッダなし・日計集計形式・9項目=QA No.21)。
+        出力履歴を csv_export_logs 相当(audit_logs)へ記録。Cache-Control no-store。
+      x-implementation-status: implemented
+      x-module: MOD-011
+      security: [{ staffAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [fromDate, toDate]
+              properties:
+                fromDate: { type: string, format: date }
+                toDate: { type: string, format: date }
+      responses:
+        "200":
+          description: CSVファイル(text/csv; charset=windows-31j。Content-Disposition: attachment)
+          content:
+            text/csv: { schema: { type: string } }
+
+  /api/staff/v1/reservations:
+    post:
+      tags: [staff]
+      operationId: createStaffReservation
+      summary: 代行予約・仮押さえ(REQ-021。SC-S02。窓口担当以上)
+      x-implementation-status: designed   # P5実装(MOD-310関連)
+      security: [{ staffAuth: [] }]
+      responses:
+        "201": { description: 代行予約/仮押さえ成立 }
+  /api/staff/v1/registrations/{id}/approval:
+    put:
+      tags: [staff]
+      operationId: approveRegistration
+      summary: 本人確認・本登録/差戻し(REQ-001。窓口担当以上)
+      x-implementation-status: designed   # P5実装(MOD-301)
+      security: [{ staffAuth: [] }]
+      parameters: [{ $ref: '#/components/parameters/genericId' }]
+      responses:
+        "200": { description: 承認/差戻し結果 }
+  /api/staff/v1/exemption-applications/{id}/decision:
+    put:
+      tags: [staff]
+      operationId: decideExemption
+      summary: 減免承認/否認(REQ-018。所管課以上)
+      x-implementation-status: designed   # P5実装(MOD-304)
+      security: [{ staffAuth: [] }]
+      parameters: [{ $ref: '#/components/parameters/genericId' }]
+      responses:
+        "200": { description: 審査結果+料金再計算結果 }
+  /api/staff/v1/payments:
+    post:
+      tags: [staff]
+      operationId: registerCounterPayment
+      summary: 現金収納消込(REQ-017。窓口担当以上)
+      x-implementation-status: designed   # P5実装(MOD-303)
+      security: [{ staffAuth: [] }]
+      responses:
+        "201": { description: 消込完了 }
+  /api/staff/v1/payment-slips:
+    post:
+      tags: [staff]
+      operationId: issuePaymentSlip
+      summary: 納付書発行(REQ-017。GS1-128バーコード=KSM-ADR-011)
+      x-implementation-status: designed   # P5実装(MOD-303/309)
+      security: [{ staffAuth: [] }]
+      responses:
+        "201": { description: 納付書PDF生成受付 }
+  /api/staff/v1/refunds:
+    get:
+      tags: [staff]
+      operationId: listRefunds
+      summary: 還付対象一覧(REQ-019。所管課以上)
+      x-implementation-status: designed   # P5実装(MOD-305)
+      security: [{ staffAuth: [] }]
+      responses:
+        "200": { description: 還付対象一覧 }
+  /api/staff/v1/fee-master:
+    put:
+      tags: [staff]
+      operationId: updateFeeMaster
+      summary: 料金マスタ保守(REQ-015。所管課以上。適用開始日付き版管理)
+      x-implementation-status: designed   # P5実装(MOD-310)
+      security: [{ staffAuth: [] }]
+      responses:
+        "200": { description: 保守完了 }
+  /api/staff/v1/closures:
+    put:
+      tags: [staff]
+      operationId: updateClosures
+      summary: 休館日・優先枠設定(REQ-022。所管課以上)
+      x-implementation-status: designed   # P5実装(MOD-310)
+      security: [{ staffAuth: [] }]
+      responses:
+        "200": { description: 設定完了 }
+  /api/staff/v1/lottery-periods/{id}/promotions:
+    post:
+      tags: [staff]
+      operationId: promoteLottery
+      summary: 抽選繰上げ実行(REQ-008。落選順位リストに基づく職員操作=KSM-BRL-001 §5.4)
+      x-implementation-status: designed   # P5実装(MOD-009拡張)
+      security: [{ staffAuth: [] }]
+      parameters: [{ $ref: '#/components/parameters/genericId' }]
+      responses:
+        "200": { description: 繰上げ結果 }
+  /api/staff/v1/stats/monthly:
+    get:
+      tags: [staff]
+      operationId: getMonthlyStats
+      summary: 統計照会(REQ-025。参照以上)
+      x-implementation-status: designed   # P5実装(MOD-306)
+      security: [{ staffAuth: [] }]
+      responses:
+        "200": { description: 月次統計 }
+  /api/staff/v1/audit-logs:
+    get:
+      tags: [staff]
+      operationId: searchAuditLogs
+      summary: 操作ログ検索(REQ-024。adminのみ)
+      x-implementation-status: designed   # P5実装(MOD-311)
+      security: [{ staffAuth: [] }]
+      responses:
+        "200": { description: 検索結果 }
+
+  /api/webhooks/payment:
+    post:
+      tags: [webhook]
+      operationId: receivePaymentWebhook
+      summary: 決済結果Webhook(REQ-016。HMAC-SHA256署名検証+IP制限)
+      description: 署名検証(verifyWebhookSignature=実装済み)→受信記録同期→消込はSQS経由非同期(WK-02=P5実装)。冪等(同一取引IDの再通知は無視)。
+      x-implementation-status: designed   # 署名検証部のみ実装済み(MOD-013スタブ)
+      responses:
+        "200": { description: 受信確認 }
+
+components:
+  parameters:
+    reservationId:
+      name: id
+      in: path
+      required: true
+      description: 予約ID
+      schema: { type: integer, format: int64 }
+    genericId:
+      name: id
+      in: path
+      required: true
+      schema: { type: integer, format: int64 }
+  securitySchemes:
+    userAuth:
+      type: openIdConnect
+      openIdConnectUrl: https://cognito-idp.ap-northeast-1.amazonaws.com/{userPoolId}/.well-known/openid-configuration
+      description: 利用者プール(BFF方式・httpOnly Cookie=KSM-ADR-004)。P4はdev暫定ヘッダ X-Dev-User-Id(S-1)。
+    staffAuth:
+      type: openIdConnect
+      openIdConnectUrl: https://cognito-idp.ap-northeast-1.amazonaws.com/{staffPoolId}/.well-known/openid-configuration
+      description: 職員プール(MFA必須+WAF IP制限14拠点)。P4はdev暫定ヘッダ X-Dev-Staff-Id(S-1)。
+  schemas:
+    AvailabilitySlot:
+      type: object
+      description: コマ別空き状況(個人情報を含まない公開データ)
+      required: [unitId, useDate, slotId, status]
+      properties:
+        unitId: { type: integer, format: int64 }
+        useDate: { type: string, format: date }
+        slotId: { type: integer, format: int64 }
+        status:
+          type: string
+          enum: [OPEN, RESERVED, CLOSED, PRIORITY]
+          description: 空き/予約済/休館/優先枠(色のみに依存しない表示=REQ-014)
+    ReservationRequest:
+      type: object
+      description: 実装DTO=ReservationRequestDto(Bean Validation必須=KSM-DEV-002 S-53)
+      required: [facilityId, purpose, items, idempotencyKey]
+      properties:
+        facilityId: { type: integer, format: int64, minimum: 1 }
+        purpose: { type: string, maxLength: 200 }
+        items:
+          type: array
+          minItems: 1
+          maxItems: 26
+          description: 一括予約(連続・複数・定期はクライアントで展開。最大26コマ/申込=KSM-BRL-001 §2.1-2)
+          items:
+            type: object
+            required: [unitId, useDate, slotId]
+            properties:
+              unitId: { type: integer, format: int64, minimum: 1 }
+              useDate: { type: string, format: date }
+              slotId: { type: integer, format: int64, minimum: 1 }
+        idempotencyKey:
+          type: string
+          maxLength: 64
+          description: 二重送信防止(同一キーは前回結果を返却)
+      # 注記: 付帯設備指定(equipments)は旧KSM-DDD-001 §4.4の設計項目だが、P4実装
+      # 範囲外(設備予約はマスタ保守=MOD-310と併せてP5実装)。スキーマはP5拡張時に追加。
+    ReservationResponse:
+      type: object
+      description: 実装DTO=ReservationResponseDto
+      required: [reservationId, status, billing, paymentMethods]
+      properties:
+        reservationId: { type: integer, format: int64 }
+        status: { type: string, enum: [pending] }
+        billing:
+          type: object
+          required: [baseAmount, equipmentAmount, exemptionAmount, billedAmount, dueAt, detail]
+          properties:
+            baseAmount: { type: integer, description: 基本料金計(円) }
+            equipmentAmount: { type: integer, description: 設備料金計(円) }
+            exemptionAmount: { type: integer, description: 減免額(円) }
+            billedAmount: { type: integer, description: 請求額=base+equipment−exemption }
+            dueAt: { type: string, format: date-time, description: 支払期限(申込+7日=DEFAULT_PAYMENT_DUE_DAYS) }
+            detail:
+              type: array
+              description: 算定明細(KSM-BRL-001 §3.1。billings.calculation_detailと同源)
+              items:
+                type: object
+                properties:
+                  unitId: { type: integer, format: int64 }
+                  useDate: { type: string, format: date }
+                  slotId: { type: integer, format: int64 }
+                  appliedFeeId: { type: integer, format: int64, description: 適用料金表版(申込日基準=QA No.12) }
+                  amount: { type: integer, description: 明細料金(円) }
+        paymentMethods:
+          type: array
+          items: { type: string, enum: [online, counter, slip] }
+    CancellationResponse:
+      type: object
+      description: 実装DTO=ReservationController.CancellationResponseDto
+      required: [cancellationCharge, expectedRefund, freeCancelDeadline, cancelled]
+      properties:
+        cancellationCharge: { type: integer, description: キャンセル料(円。7日前まで0/6日前以降100%=QA No.11) }
+        expectedRefund: { type: integer, description: 還付見込額(円)=収納済額−キャンセル料 }
+        freeCancelDeadline: { type: string, format: date, description: 無料取消期限 }
+        cancelled: { type: boolean, description: preview=false/cancel=true }
+    LotteryExecutionSummary:
+      type: object
+      required: [entryCount, wonCount, lostCount]
+      properties:
+        entryCount: { type: integer, description: 申込数 }
+        wonCount: { type: integer, description: 当選数 }
+        lostCount: { type: integer, description: 落選数 }
+    Problem:
+      type: object
+      description: RFC 9457 Problem Details(type=https://yoyaku.city.kasumidai.lg.jp/problems/{code})
+      properties:
+        type: { type: string, format: uri }
+        title: { type: string }
+        status: { type: integer }
+    SlotConflictProblem:
+      allOf:
+        - $ref: '#/components/schemas/Problem'
+        - type: object
+          properties:
+            conflictItems:
+              type: array
+              description: 不成立コマの全件一覧(部分自動確定は行わない=KSM-BRL-001 §2.1-3)
+              items:
+                type: object
+                properties:
+                  unitId: { type: integer, format: int64 }
+                  useDate: { type: string, format: date }
+                  slotId: { type: integer, format: int64 }
+                  reason:
+                    type: string
+                    enum: [RESERVED, CLOSED, PRIORITY_SLOT, LIMIT_EXCEEDED]
+                    description: 実装enum=ConflictReason
+    ValidationProblem:
+      allOf:
+        - $ref: '#/components/schemas/Problem'
+        - type: object
+          properties:
+            fields:
+              type: array
+              items:
+                type: object
+                properties:
+                  field: { type: string }
+                  message: { type: string }

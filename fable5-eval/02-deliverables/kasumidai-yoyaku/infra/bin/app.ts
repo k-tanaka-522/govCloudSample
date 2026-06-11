@@ -19,6 +19,7 @@ import { AwsSolutionsChecks } from 'cdk-nag';
 import { Aspects } from 'aws-cdk-lib';
 import { NetworkStack } from '../lib/network-stack';
 import { StatefulStack } from '../lib/stateful-stack';
+import { PipelineStack } from '../lib/pipeline-stack';
 import { AppStack } from '../lib/app-stack';
 import { DeliveryStack } from '../lib/delivery-stack';
 import { MonitoringStack } from '../lib/monitoring-stack';
@@ -83,7 +84,21 @@ const statefulStack = new StatefulStack(app, `yoyaku-${envName}-stateful`, {
 });
 statefulStack.addDependency(networkStack);
 
-// ── 3. アプリスタック ─────────────────────────────────────────────
+// ── 3. パイプラインスタック(ECR + CodeBuild CI) ───────────────────
+// 【制度判断】CodeCommit は 2024年7月以降、新規顧客の利用が停止されている。
+// 代替として CodeBuild の GitHub ソース(公開リポジトリ直接参照)を使用する。
+// 参照: https://docs.aws.amazon.com/codecommit/latest/userguide/limits.html
+const pipelineStack = new PipelineStack(app, `yoyaku-${envName}-pipeline`, {
+  env,
+  params,
+  dataKey: statefulStack.dataKey,
+  logKey: statefulStack.logKey,
+  stackName: `yoyaku-${envName}-pipeline`,
+  description: `霞台市公共施設予約システム(${envName}) - パイプライン(ECR・CodeBuild CI)`,
+});
+pipelineStack.addDependency(statefulStack);
+
+// ── 4. アプリスタック ─────────────────────────────────────────────
 const appStack = new AppStack(app, `yoyaku-${envName}-app`, {
   env,
   params,
@@ -93,6 +108,9 @@ const appStack = new AppStack(app, `yoyaku-${envName}-app`, {
   dataKey: statefulStack.dataKey,
   logKey: statefulStack.logKey,
   dbSecretArn: statefulStack.dbSecret.secretArn,
+  // RDS エンドポイントは JDBC URL 組み立てに使用(KSM-ENV-001 §5)
+  dbEndpoint: statefulStack.dbInstance.dbInstanceEndpointAddress,
+  dbName: 'yoyakudb',
   dataBucketName: statefulStack.dataS3.bucketName,
   logBucketName: statefulStack.logS3.bucketName,
   stackName: `yoyaku-${envName}-app`,
@@ -100,7 +118,7 @@ const appStack = new AppStack(app, `yoyaku-${envName}-app`, {
 });
 appStack.addDependency(statefulStack);
 
-// ── 4. 配信スタック(CloudFront + WAF) ────────────────────────────
+// ── 5. 配信スタック(CloudFront + WAF) ────────────────────────────
 // NOTE: DeliveryStack は CloudFront 用 WAF を含むため us-east-1 での作成が必要。
 // ただし CDK では同一アカウント内の他リージョンスタックを通常の方法で参照できる。
 // WAF を us-east-1 で分離する場合は Cross-Region Ref が必要だが、
@@ -118,7 +136,7 @@ const deliveryStack = new DeliveryStack(app, `yoyaku-${envName}-delivery`, {
 });
 deliveryStack.addDependency(appStack);
 
-// ── 5. 監視スタック ────────────────────────────────────────────────
+// ── 6. 監視スタック ────────────────────────────────────────────────
 const monitoringStack = new MonitoringStack(app, `yoyaku-${envName}-monitoring`, {
   env,
   params,
@@ -133,6 +151,7 @@ const monitoringStack = new MonitoringStack(app, `yoyaku-${envName}-monitoring`,
 });
 monitoringStack.addDependency(appStack);
 
+void pipelineStack;
 void deliveryStack;
 void monitoringStack;
 

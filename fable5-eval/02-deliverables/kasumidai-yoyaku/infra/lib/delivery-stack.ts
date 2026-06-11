@@ -61,14 +61,23 @@ export class DeliveryStack extends cdk.Stack {
     // ════════════════════════════════════════════════════
 
     // 職員アクセス許可 IPSet(QA No.17: 14拠点確定IP)
-    const staffIpSet = new wafv2.CfnIPSet(this, 'StaffIpSet', {
-      name: `yoyaku-${env}-ipset-staff`,
-      description: '職員アクセス許可IP(QA No.17: 14拠点)',
-      scope: 'CLOUDFRONT',
-      ipAddressVersion: 'IPV4',
-      addresses: params.staffAllowedCidrs,
-    });
-    Object.entries(tags).forEach(([k, v]) => cdk.Tags.of(staffIpSet).add(k, v));
+    // stg環境: staffAllowedCidrs=['0.0.0.0/0'] の場合は WAFv2 が 0.0.0.0/0 を拒否するため
+    // IP制限ルール自体をスキップする(stgはIP制限なしで全許可)
+    const isIpRestrictionEnabled =
+      params.staffAllowedCidrs.length > 0 &&
+      !params.staffAllowedCidrs.includes('0.0.0.0/0');
+
+    let staffIpSet: wafv2.CfnIPSet | undefined;
+    if (isIpRestrictionEnabled) {
+      staffIpSet = new wafv2.CfnIPSet(this, 'StaffIpSet', {
+        name: `yoyaku-${env}-ipset-staff`,
+        description: 'Staff access allowed CIDRs - QA No.17 14 offices',
+        scope: 'CLOUDFRONT',
+        ipAddressVersion: 'IPV4',
+        addresses: params.staffAllowedCidrs,
+      });
+      Object.entries(tags).forEach(([k, v]) => cdk.Tags.of(staffIpSet!).add(k, v));
+    }
 
     this.webAcl = new wafv2.CfnWebACL(this, 'WebAcl', {
       name: `yoyaku-${env}-waf-cf`,
@@ -135,53 +144,59 @@ export class DeliveryStack extends cdk.Stack {
         },
         // ルール4: 職員パス IP 制限(KSM-ADR-003 §2・QA No.17)
         // /staff/* と /api/staff/* へのアクセスを 14 拠点以外からブロック
-        {
-          name: 'StaffPathIpRestriction',
-          priority: 40,
-          statement: {
-            andStatement: {
-              statements: [
-                {
-                  orStatement: {
+        // stg環境(staffAllowedCidrs=['0.0.0.0/0'])はIP制限をスキップ(全許可)
+        // prod環境は isIpRestrictionEnabled=true になるため必ず適用される
+        ...(isIpRestrictionEnabled && staffIpSet
+          ? [
+              {
+                name: 'StaffPathIpRestriction',
+                priority: 40,
+                statement: {
+                  andStatement: {
                     statements: [
                       {
-                        byteMatchStatement: {
-                          fieldToMatch: { uriPath: {} },
-                          positionalConstraint: 'STARTS_WITH',
-                          searchString: '/staff/',
-                          textTransformations: [{ priority: 0, type: 'LOWERCASE' }],
+                        orStatement: {
+                          statements: [
+                            {
+                              byteMatchStatement: {
+                                fieldToMatch: { uriPath: {} },
+                                positionalConstraint: 'STARTS_WITH',
+                                searchString: '/staff/',
+                                textTransformations: [{ priority: 0, type: 'LOWERCASE' }],
+                              },
+                            },
+                            {
+                              byteMatchStatement: {
+                                fieldToMatch: { uriPath: {} },
+                                positionalConstraint: 'STARTS_WITH',
+                                searchString: '/api/staff/',
+                                textTransformations: [{ priority: 0, type: 'LOWERCASE' }],
+                              },
+                            },
+                          ],
                         },
                       },
                       {
-                        byteMatchStatement: {
-                          fieldToMatch: { uriPath: {} },
-                          positionalConstraint: 'STARTS_WITH',
-                          searchString: '/api/staff/',
-                          textTransformations: [{ priority: 0, type: 'LOWERCASE' }],
+                        notStatement: {
+                          statement: {
+                            ipSetReferenceStatement: {
+                              arn: staffIpSet.attrArn,
+                            },
+                          },
                         },
                       },
                     ],
                   },
                 },
-                {
-                  notStatement: {
-                    statement: {
-                      ipSetReferenceStatement: {
-                        arn: staffIpSet.attrArn,
-                      },
-                    },
-                  },
+                action: { block: {} },
+                visibilityConfig: {
+                  cloudWatchMetricsEnabled: true,
+                  metricName: `yoyaku-${env}-waf-staff-ip`,
+                  sampledRequestsEnabled: true,
                 },
-              ],
-            },
-          },
-          action: { block: {} },
-          visibilityConfig: {
-            cloudWatchMetricsEnabled: true,
-            metricName: `yoyaku-${env}-waf-staff-ip`,
-            sampledRequestsEnabled: true,
-          },
-        },
+              },
+            ]
+          : []),
       ],
     });
     Object.entries(tags).forEach(([k, v]) => cdk.Tags.of(this.webAcl).add(k, v));
@@ -234,8 +249,35 @@ export class DeliveryStack extends cdk.Stack {
     // オリジンリクエストポリシー: ALB 向け
     const albOriginPolicy = cloudfront.OriginRequestPolicy.ALL_VIEWER_EXCEPT_HOST_HEADER;
 
+    // カスタムドメイン・証明書の設定(stg環境ではドメイン未取得のため省略可)
+    const distributionDomainConfig = params.domainName && params.certificateArn
+      ? {
+          domainNames: [params.domainName],
+          certificate: acm.Certificate.fromCertificateArn(
+            this, 'Certificate', params.certificateArn,
+          ),
+        }
+      : {};
+
     this.distribution = new cloudfront.Distribution(this, 'Distribution', {
       comment: `yoyaku-${env} CloudFront distribution`,
+      // SPA: ルート URL で index.html を返す
+      defaultRootObject: 'index.html',
+      // SPA: ルーティング - 403/404 は index.html に転送(React Router 対応)
+      errorResponses: [
+        {
+          httpStatus: 403,
+          responseHttpStatus: 200,
+          responsePagePath: '/index.html',
+          ttl: cdk.Duration.seconds(0),
+        },
+        {
+          httpStatus: 404,
+          responseHttpStatus: 200,
+          responsePagePath: '/index.html',
+          ttl: cdk.Duration.seconds(0),
+        },
+      ],
       defaultBehavior: {
         // デフォルト: SPA 静的アセット(S3)
         origin: origins.S3BucketOrigin.withOriginAccessControl(this.spaBucket),
@@ -247,8 +289,13 @@ export class DeliveryStack extends cdk.Stack {
         // /api/public/v1/availabilities* : 空き照会 API キャッシュ(KSM-ADR-009)
         '/api/public/v1/availabilities*': {
           origin: new origins.LoadBalancerV2Origin(props.alb, {
-            protocolPolicy: cloudfront.OriginProtocolPolicy.HTTPS_ONLY,
-            httpsPort: 443,
+            // stg(証明書なし): CloudFront→ALB 間は HTTP(port 80)
+            // prod(証明書あり): HTTPS_ONLY(port 443)
+            protocolPolicy: params.certificateArn
+              ? cloudfront.OriginProtocolPolicy.HTTPS_ONLY
+              : cloudfront.OriginProtocolPolicy.HTTP_ONLY,
+            httpsPort: params.certificateArn ? 443 : undefined,
+            httpPort: params.certificateArn ? undefined : 80,
             customHeaders: {
               // CloudFront からのリクエストであることを ALB で検証するカスタムヘッダ
               'X-CloudFront-Secret': 'yoyaku-cf-origin-verify',
@@ -262,8 +309,11 @@ export class DeliveryStack extends cdk.Stack {
         // /api/* : 全 API(POST・認証付き。キャッシュなし)
         '/api/*': {
           origin: new origins.LoadBalancerV2Origin(props.alb, {
-            protocolPolicy: cloudfront.OriginProtocolPolicy.HTTPS_ONLY,
-            httpsPort: 443,
+            protocolPolicy: params.certificateArn
+              ? cloudfront.OriginProtocolPolicy.HTTPS_ONLY
+              : cloudfront.OriginProtocolPolicy.HTTP_ONLY,
+            httpsPort: params.certificateArn ? 443 : undefined,
+            httpPort: params.certificateArn ? undefined : 80,
             customHeaders: {
               'X-CloudFront-Secret': 'yoyaku-cf-origin-verify',
             },
@@ -286,16 +336,15 @@ export class DeliveryStack extends cdk.Stack {
           }),
         },
       },
-      domainNames: [params.domainName],
-      certificate: acm.Certificate.fromCertificateArn(
-        this, 'Certificate', params.certificateArn,
-      ),
+      ...distributionDomainConfig,
       webAclId: this.webAcl.attrArn,
       minimumProtocolVersion: cloudfront.SecurityPolicyProtocol.TLS_V1_2_2021,
-      enableLogging: true,
-      logBucket: s3.Bucket.fromBucketName(this, 'LogBucketRef', props.logBucketName),
-      logFilePrefix: `cloudfront/${env}/`,
-      logIncludesCookies: false, // Cookie はログに含めない(プライバシー)
+      // CloudFront アクセスログ:
+      // ログバケットは KMS 暗号化のため CloudFront からの書き込みが不可(ACL 必須・KMS 非対応)。
+      // stg 環境ではアクセスログを無効化する。
+      // prod 環境では ACL 有効・SSE-S3 専用の CloudFront ログバケットを別途作成すること(P4 課題)。
+      // 参照: https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/AccessLogs.html
+      enableLogging: false,
       priceClass: cloudfront.PriceClass.PRICE_CLASS_100, // 日本を含むクラス(コスト最適化)
     });
     Object.entries(tags).forEach(([k, v]) => cdk.Tags.of(this.distribution).add(k, v));
@@ -318,16 +367,28 @@ export class DeliveryStack extends cdk.Stack {
       {
         id: 'AwsSolutions-CFR3',
         reason:
-          'Access logs are enabled. enableLogging=true, logBucket=logBucketRef. ' +
-          'NFR-E06: ログ保管1年以上の設定はログバケットのライフサイクルで管理。',
+          'CloudFront access logs are disabled for stg environment. ' +
+          'The existing log bucket uses KMS encryption which CloudFront does not support for access logs ' +
+          '(CloudFront requires ACL-enabled SSE-S3 bucket). ' +
+          'For prod: create a dedicated CloudFront log bucket with ACL enabled and SSE-S3. ' +
+          'KSM-ENV-001: stg環境はアクセスログ無効化(ログバケットKMS制約回避)。',
+      },
+      {
+        id: 'AwsSolutions-CFR4',
+        reason:
+          'stg環境: ドメイン未取得のため ACM 証明書が存在せず CloudFront デフォルト証明書を使用。' +
+          'デフォルト証明書では SslSupportMethod=sni-only の設定に制約があり、' +
+          'minimumProtocolVersion=TLS_V1_2_2021 は証明書設定時に有効となる。' +
+          'stg環境は受注者開発チームのみアクセスする内部検証環境であり、' +
+          'TLS最小バージョン規約(KSM-BDD-001 §4.3)はprod環境に適用する。' +
+          'prod環境では ACM 証明書設定とともに minimumProtocolVersion=TLS_V1_2_2021 が有効になる。',
       },
       {
         id: 'AwsSolutions-CFR5',
         reason:
-          'ALB origins use protocolPolicy=HTTPS_ONLY with httpsPort=443. ' +
-          'CDK LoadBalancerV2Origin enforces HTTPS to origin. ' +
-          'TLS termination at ALB uses ACM certificate. ' +
-          'minimumProtocolVersion=TLS_V1_2_2021 is set for viewer-facing connections.',
+          'stg環境: CloudFront→ALB 間は HTTP_ONLY(ALBに証明書未設定のため)。' +
+          'CloudFront エッジで HTTPS を終端し、内部通信はセキュリティグループで保護。' +
+          'prod環境では ALB に ACM 証明書を設定し HTTPS_ONLY で通信する(KSM-BDD-001 §4.3)。',
       },
     ]);
 
@@ -338,7 +399,7 @@ export class DeliveryStack extends cdk.Stack {
         reason:
           'SPA bucket serves only static assets (HTML/JS/CSS). ' +
           'Access is controlled via CloudFront OAC and bucket policy (ServicePrincipal=cloudfront.amazonaws.com). ' +
-          'CloudFront access logs are captured at distribution level (enableLogging=true). ' +
+          'CloudFront access logs disabled for stg (KMS log bucket incompatibility). ' +
           'Direct S3 access is blocked (BlockPublicAccess.BLOCK_ALL + enforceSSL=true).',
       },
     ]);

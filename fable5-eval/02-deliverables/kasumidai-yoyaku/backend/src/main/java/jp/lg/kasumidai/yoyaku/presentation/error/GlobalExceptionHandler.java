@@ -2,11 +2,14 @@ package jp.lg.kasumidai.yoyaku.presentation.error;
 
 import jp.lg.kasumidai.yoyaku.domain.common.DomainException;
 import jp.lg.kasumidai.yoyaku.domain.reservation.SlotConflictException;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ProblemDetail;
 import org.springframework.web.bind.MethodArgumentNotValidException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
+import org.springframework.web.servlet.resource.NoResourceFoundException;
 
 /**
  * 共通例外ハンドラ(一元化。KSM-DEV-002 S-23)。
@@ -16,6 +19,7 @@ import org.springframework.web.bind.annotation.RestControllerAdvice;
 @RestControllerAdvice
 public class GlobalExceptionHandler {
 
+  private static final Logger LOG = LoggerFactory.getLogger(GlobalExceptionHandler.class);
   private static final String PROBLEM_TYPE_BASE = "https://yoyaku.city.kasumidai.lg.jp/problems/";
 
   /** 一括予約の全件不成立(409+不成立コマ全件一覧=KSM-DDD-001 §4.4)。 */
@@ -61,9 +65,19 @@ public class GlobalExceptionHandler {
     return problem;
   }
 
+  /** 存在しないリソースへのアクセス(404。Spring Boot 3.2+のNoResourceFoundException)。 */
+  @ExceptionHandler(NoResourceFoundException.class)
+  public ProblemDetail handleNotFound(NoResourceFoundException e) {
+    ProblemDetail problem = ProblemDetail.forStatus(HttpStatus.NOT_FOUND);
+    problem.setType(java.net.URI.create(PROBLEM_TYPE_BASE + "not-found"));
+    problem.setTitle("指定されたリソースが見つかりません");
+    return problem;
+  }
+
   /** 技術例外(500。内部情報は返さない=S-23。詳細はサーバログのみ)。 */
   @ExceptionHandler(Exception.class)
   public ProblemDetail handleUnexpected(Exception e) {
+    LOG.error("Unexpected error occurred", e);
     ProblemDetail problem = ProblemDetail.forStatus(HttpStatus.INTERNAL_SERVER_ERROR);
     problem.setType(java.net.URI.create(PROBLEM_TYPE_BASE + "internal-error"));
     problem.setTitle("システムエラーが発生しました。時間をおいて再度お試しください");

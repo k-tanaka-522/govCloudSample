@@ -3,3 +3,4 @@ dist/
 target/
 cdk.out/
 *.log
+cdk.context.json

@@ -20,7 +20,7 @@ public class JdbcAvailabilityRepository implements AvailabilityRepository {
   @Override
   public List<AvailabilitySlotRow> findMonthlyAvailability(long facilityId, YearMonth month) {
     return jdbc.query(
-        "SELECT u.unit_id, d.use_date, d.slot_id, "
+        "SELECT u.unit_id, gs.use_date::date AS use_date, s.slot_id, "
             + "CASE WHEN c.closure_type = 'closed' THEN 'closed' "
             + "     WHEN c.closure_type = 'priority' THEN 'priority' "
             + "     WHEN d.status IS NOT NULL THEN 'reserved' "
